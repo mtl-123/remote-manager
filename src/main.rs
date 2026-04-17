@@ -767,81 +767,117 @@ fn delete_host(cfg: &mut Config) -> io::Result<()> {
     Ok(())
 }
 
-// ==================== RDP 连接 ====================
-fn select_rdp_features() -> io::Result<Vec<&'static str>> {
-    println!("====== FreeRDP 连接工具 ======");
-    println!("请选择需要启用的功能（可多选，空格分隔）：\n");
-    println!("【1】全屏模式");
-    println!("【2】剪切板同步");
-    println!("【3】管理员(控制台)模式");
-    println!("【4】性能优化（关闭特效）");
-    println!("【5】自动重连");
-    println!("================================\n");
+/// 展开路径中的 ~ 为用户家目录绝对路径
+fn expand_home_path(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Some(home) = std::env::home_dir() {
+            if let Some(home_str) = home.to_str() {
+                return path.replace("~/", &format!("{}/", home_str));
+            }
+        }
+    }
+    path.to_string()
+}
 
-    let input = read_line("输入选项(例如:1 2 5):")?;
+/// 选择RDP增强功能
+fn select_rdp_features(_host_drive: &str) -> io::Result<Vec<String>> {
+    println!("\n{:=<50}", "");
+    println!("{:^50}", "RDP 增强功能配置");
+    println!("{:=<50}", "");
+    println!(" 【1】全屏模式");
+    println!(" 【2】自适应分辨率（自动适配窗口）");
+    println!(" 【3】剪切板同步（文本/文件双向）");
+    println!(" 【4】音频输出重定向（ALSA）");
+    println!(" 【5】麦克风输入重定向（ALSA）");
+    println!(" 【6】映射当前用户家目录 ~/");
+    println!(" 【7】管理员/控制台模式");
+    println!(" 【8】性能优化（低带宽流畅模式）");
+    println!(" 【9】自动重连（断网自动恢复）");
+    println!("{:-<50}", "");
+    println!("支持多选，空格分隔输入 示例：1 3 4 6");
+    println!("{:-<50}", "\n");
+
+    let input = read_line("请输入功能序号：")?;
+    // 调试打印：你输入的原始内容
+    println!("你输入的选项：[{}]", input);
+
     let selections: Vec<u8> = input
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    // 🔥 终极兼容参数（所有 xfreerdp3 通用，无任何语法错误）
-    let mut args = vec!["/cert:ignore"];
+    // 调试打印：解析后的选项列表
+    println!("🔍 解析后的选项：{:?}", selections);
+
+    // 基础参数
+    let mut args = vec!["/cert:ignore".to_string()];
+
+    // 强制获取家目录
+    let home_dir = std::env::home_dir().expect("获取家目录失败");
+    let home_str = home_dir.to_str().expect("转换家目录失败");
+    println!("🔍 当前用户家目录：{}", home_str);
+
+    // ====================== 核心修复 ======================
+    args.push(format!("/drive:home,{}", home_str));
+    println!("已强制添加家目录映射参数");
+    // ======================================================
 
     for s in selections {
         match s {
-            1 => args.push("/f"),           // 1. 全屏（标准语法）
-            2 => args.push("+clipboard"),   // 2. 剪切板（标准语法）
-            3 => args.push("/console"),    // 3. 控制台/管理员模式（兼容最强）
-            4 => {
-                // 4. 性能优化（无错误标准参数）
-                args.push("-wallpaper");
-                args.push("-themes");
+            1 => args.push("/f".to_string()),
+            2 => args.push("/dynamic-resolution".to_string()),
+            3 => args.push("+clipboard".to_string()),
+            4 => args.push("/sound:sys:alsa".to_string()),
+            5 => args.push("/microphone:sys:alsa".to_string()),
+            6 => args.push(format!("/drive:home,{}", home_str)),
+            7 => args.push("/console".to_string()),
+            8 => {
+                args.push("-wallpaper".to_string());
+                args.push("-themes".to_string());
             }
-            5 => args.push("+auto-reconnect"), // 5. 自动重连（标准语法）
+            9 => args.push("+auto-reconnect".to_string()),
             _ => {}
         }
     }
 
+    // 打印最终参数
+    println!("\n{:-<50}", "");
+    println!("{:^50}", "已拼接 RDP 命令参数");
+    println!("{:-<50}", "");
+    for (idx, arg) in args.iter().enumerate() {
+        println!("  {}. {}", idx + 1, arg);
+    }
+    println!("{:-<50}", "\n");
+
     Ok(args)
 }
 
-
-
-
 fn spawn_daemon(cmd: &mut Command) -> io::Result<()> {
-    
     cmd.stdin(Stdio::null())
-       .stdout(Stdio::null())
-       .stderr(Stdio::null());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
-    
     #[cfg(unix)]
     unsafe {
         use libc::{fork, setsid};
         // 第一次 fork
         match fork() {
-            // 🔥 修复：删除多余 return
             -1 => Err(io::Error::last_os_error()),
             0 => {
-                // 子进程：新建会话，脱离父终端
                 setsid();
-                // 第二次 fork，彻底失去会话控制
                 match fork() {
                     -1 => std::process::exit(1),
                     0 => {
-                        // 孙进程：真正执行 RDP，完全独立
                         let _ = cmd.spawn();
                         std::process::exit(0);
                     }
                     _ => std::process::exit(0),
                 }
             }
-            // 🔥 修复：删除多余 return
             _ => Ok(()),
         }
     }
 
-    // Windows 备用逻辑
     #[cfg(windows)]
     {
         cmd.spawn()?;
@@ -855,13 +891,22 @@ fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
         None => return Ok(()),
     };
 
-    // 更新连接时间
+    // 🔥 修复：添加 as u64 类型强转
     cfg.hosts[idx].last_connected_at = Local::now().timestamp() as u64;
     save_config(cfg)?;
 
     let host = &cfg.hosts[idx];
-    let rdp_args = select_rdp_features()?;
+    let rdp_args = select_rdp_features(&host.drive)?;
     let password = host.password()?;
+
+    // 格式化美观打印连接信息
+    println!("\n{:=<50}", "");
+    println!("{:^50}", "RDP 连接信息");
+    println!("{:-<50}", "");
+    println!(" 🖥️  主机地址：{}", host.ip);
+    println!(" 👤 登录用户：{}", host.username);
+    println!(" 📂 共享目录：{}", expand_home_path(&host.drive));
+    println!("{:=<50}", "\n");
 
     log_action("RDP 连接", &format!("{}@{}", host.username, host.ip));
 
@@ -879,14 +924,19 @@ fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
         .arg(format!("/u:{}", host.username))
         .arg(format!("/p:{}", password));
 
-    // 🔥 核心：永久后台守护执行（退出主程序/终端，RDP 不退出）
+    // 永久后台守护执行
     spawn_daemon(&mut cmd)?;
 
-    println!("🚀 RDP 已永久后台启动 ✅");
-    println!("ℹ️ 关闭主程序/终端不影响，直接关闭 RDP 窗口断开连接\n");
+    // 最终成功提示
+    println!("\n{:-<50}", "");
+    println!("✅ RDP 已永久后台启动成功！");
+    println!("ℹ️  关闭终端/主程序不影响连接");
+    println!("ℹ️  直接关闭 RDP 窗口断开连接");
+    println!("{:-<50}", "\n");
 
     Ok(())
 }
+
 // ==================== 批量检测主机端口连通性 ====================
 fn check_all_hosts_connectivity(cfg: &Config) -> io::Result<()> {
     let hosts = &cfg.hosts;
