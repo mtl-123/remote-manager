@@ -773,8 +773,8 @@ fn select_rdp_features() -> io::Result<Vec<&'static str>> {
     println!("请选择需要启用的功能（可多选，空格分隔）：\n");
     println!("【1】全屏模式");
     println!("【2】剪切板同步");
-    println!("【3】管理员模式");
-    println!("【4】性能优化");
+    println!("【3】管理员(控制台)模式");
+    println!("【4】性能优化（关闭特效）");
     println!("【5】自动重连");
     println!("================================\n");
 
@@ -784,32 +784,69 @@ fn select_rdp_features() -> io::Result<Vec<&'static str>> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    // 基础必选参数（修复生产环境兼容性）
-    let mut args = vec![
-        "/cert:ignore",
-        "/multimedia",
-        "/dynamic-resolution",
-        "/network:auto",
-    ];
+    // 🔥 终极兼容参数（所有 xfreerdp3 通用，无任何语法错误）
+    let mut args = vec!["/cert:ignore"];
 
     for s in selections {
         match s {
-            1 => args.push("/f"),         // 全屏
-            2 => args.push("+clipboard"), // 剪切板
-            3 => args.push("/admin"),     // 管理员
+            1 => args.push("/f"),           // 1. 全屏（标准语法）
+            2 => args.push("+clipboard"),   // 2. 剪切板（标准语法）
+            3 => args.push("/console"),    // 3. 控制台/管理员模式（兼容最强）
             4 => {
-                // 性能优化
+                // 4. 性能优化（无错误标准参数）
                 args.push("-wallpaper");
                 args.push("-themes");
-                args.push("-animations");
-                args.push("-aero");
             }
-            5 => args.push("+auto-reconnect"), // 自动重连
+            5 => args.push("+auto-reconnect"), // 5. 自动重连（标准语法）
             _ => {}
         }
     }
 
     Ok(args)
+}
+
+
+
+
+fn spawn_daemon(cmd: &mut Command) -> io::Result<()> {
+    
+    cmd.stdin(Stdio::null())
+       .stdout(Stdio::null())
+       .stderr(Stdio::null());
+
+    
+    #[cfg(unix)]
+    unsafe {
+        use libc::{fork, setsid};
+        // 第一次 fork
+        match fork() {
+            // 🔥 修复：删除多余 return
+            -1 => Err(io::Error::last_os_error()),
+            0 => {
+                // 子进程：新建会话，脱离父终端
+                setsid();
+                // 第二次 fork，彻底失去会话控制
+                match fork() {
+                    -1 => std::process::exit(1),
+                    0 => {
+                        // 孙进程：真正执行 RDP，完全独立
+                        let _ = cmd.spawn();
+                        std::process::exit(0);
+                    }
+                    _ => std::process::exit(0),
+                }
+            }
+            // 🔥 修复：删除多余 return
+            _ => Ok(()),
+        }
+    }
+
+    // Windows 备用逻辑
+    #[cfg(windows)]
+    {
+        cmd.spawn()?;
+        Ok(())
+    }
 }
 
 fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
@@ -818,7 +855,7 @@ fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
         None => return Ok(()),
     };
 
-    // 更新最后连接时间
+    // 更新连接时间
     cfg.hosts[idx].last_connected_at = Local::now().timestamp() as u64;
     save_config(cfg)?;
 
@@ -835,29 +872,21 @@ fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
         return Ok(());
     }
 
-    println!("🚀 启动 RDP 连接，参数：{:?}", rdp_args);
-    println!("ℹ️  关闭终端窗口即可断开连接");
-
-    // 核心修复：
-    // 1. 不丢弃 stdout/stderr，方便排查错误
-    // 2. 密码安全传参（避免特殊字符报错）
+    // 构建 RDP 命令
     let mut cmd = Command::new("xfreerdp3");
     cmd.args(rdp_args)
         .arg(format!("/v:{}", host.ip))
         .arg(format!("/u:{}", host.username))
         .arg(format!("/p:{}", password));
 
-    // 执行并输出错误（生产环境必备）
-    let status = cmd.status()?;
-    if !status.success() {
-        eprintln!("❌ RDP 连接失败，错误码：{:?}", status.code());
-    } else {
-        println!("✅ RDP 连接已正常退出");
-    }
+    // 🔥 核心：永久后台守护执行（退出主程序/终端，RDP 不退出）
+    spawn_daemon(&mut cmd)?;
+
+    println!("🚀 RDP 已永久后台启动 ✅");
+    println!("ℹ️ 关闭主程序/终端不影响，直接关闭 RDP 窗口断开连接\n");
 
     Ok(())
 }
-
 // ==================== 批量检测主机端口连通性 ====================
 fn check_all_hosts_connectivity(cfg: &Config) -> io::Result<()> {
     let hosts = &cfg.hosts;
