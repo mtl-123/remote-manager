@@ -468,7 +468,7 @@ fn select_host_interactive(cfg: &Config, host_type: Option<HostType>) -> io::Res
         .filter(|(_, h)| host_type.is_none_or(|t| h.host_type == t))
         .collect();
 
-    hosts.sort_by(|(_, a), (_, b)| b.last_connected_at.cmp(&a.last_connected_at));
+    hosts.sort_by_key(|(_, host)| std::cmp::Reverse(host.last_connected_at));
 
     if hosts.is_empty() {
         println!("📭 没有可用主机");
