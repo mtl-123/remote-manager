@@ -203,6 +203,7 @@ env_logger = "0.11"
 aes-gcm = "0.10"
 generic-array = "0.25"
 hex = "0.4"
+libc = "0.2"
 ```
 
 ### 2. 系统运行依赖（Debian/Ubuntu）
