@@ -3,7 +3,8 @@ use chrono::Local;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, Permissions};
-use std::io::{self, IsTerminal, Write};
+// 👇 修复：补全了 ErrorKind 导入
+use std::io::{Error, ErrorKind, IsTerminal, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,9 +14,8 @@ use std::time::Duration;
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Nonce,
+    Aes256Gcm, Key, Nonce,
 };
-use generic_array::GenericArray;
 
 // ==================== 🔐 全局常量 ====================
 const APP_DIR: &str = "remote-manager-data";
@@ -25,13 +25,12 @@ const SSH_DIR: &str = "ssh";
 const LOG_DIR: &str = "logs";
 const CONFIG_FILE: &str = "config.yaml";
 const LOG_FILE: &str = "remote-manager.log";
+const KEY_FILE: &str = ".secret.key";
 const SSH_CONNECT_TIMEOUT: &str = "2";
 const CONNECT_TIMEOUT_SECS: u64 = 2;
 const PAGE_SIZE: usize = 15;
 const DEFAULT_IP_PREFIX: &str = "192.168.";
 const DEFAULT_RDP_USER: &str = "Administrator";
-
-const ENCRYPTION_KEY: &[u8; 32] = b"12345678901234561234567890123456";
 
 // ==================== 🔥 内置二进制 (Base64) ====================
 const TRZSZ_B64: &[u8] = include_bytes!("../trzsz.b64");
@@ -39,13 +38,13 @@ const TRZ_B64: &[u8] = include_bytes!("../trz.b64");
 const TSZ_B64: &[u8] = include_bytes!("../tsz.b64");
 
 // ==================== 📁 路径管理 ====================
-fn get_base_dir() -> io::Result<PathBuf> {
+fn get_base_dir() -> Result<PathBuf, Error> {
     let exe_path = std::env::current_exe()
-        .map_err(|e| io::Error::new(e.kind(), format!("无法获取程序路径: {}", e)))?;
+        .map_err(|e| Error::new(e.kind(), format!("无法获取程序路径: {}", e)))?;
 
     let bin_dir = exe_path
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定程序目录"))?
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "无法确定程序目录"))?
         .to_path_buf();
 
     let app_dir = bin_dir.join(APP_DIR);
@@ -57,42 +56,62 @@ fn get_base_dir() -> io::Result<PathBuf> {
     Ok(app_dir)
 }
 
-fn mk_dir(name: &str) -> io::Result<PathBuf> {
+fn mk_dir(name: &str) -> Result<PathBuf, Error> {
     let p = get_base_dir()?.join(name);
     if !p.exists() {
         fs::create_dir_all(&p)?;
     }
     Ok(p)
 }
-fn get_config_dir() -> io::Result<PathBuf> {
+fn get_config_dir() -> Result<PathBuf, Error> {
     mk_dir(CONFIG_DIR)
 }
-fn get_cache_dir() -> io::Result<PathBuf> {
+fn get_cache_dir() -> Result<PathBuf, Error> {
     mk_dir(CACHE_DIR)
 }
-fn get_ssh_dir() -> io::Result<PathBuf> {
+fn get_ssh_dir() -> Result<PathBuf, Error> {
     mk_dir(SSH_DIR)
 }
-fn get_log_dir() -> io::Result<PathBuf> {
+fn get_log_dir() -> Result<PathBuf, Error> {
     mk_dir(LOG_DIR)
 }
-fn get_known_hosts_path() -> io::Result<PathBuf> {
+fn get_known_hosts_path() -> Result<PathBuf, Error> {
     get_ssh_dir().map(|p| p.join("known_hosts"))
 }
-fn get_config_path() -> io::Result<PathBuf> {
+fn get_config_path() -> Result<PathBuf, Error> {
     get_config_dir().map(|p| p.join(CONFIG_FILE))
 }
-fn get_log_path() -> io::Result<PathBuf> {
+fn get_log_path() -> Result<PathBuf, Error> {
     get_log_dir().map(|p| p.join(LOG_FILE))
 }
+fn get_key_path() -> Result<PathBuf, Error> {
+    get_config_dir().map(|p| p.join(KEY_FILE))
+}
 fn get_home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("~"))
+    std::env::home_dir().unwrap_or_else(|| PathBuf::from("~"))
+}
+
+// ==================== 安全密钥管理 ====================
+fn load_or_generate_key() -> Result<[u8; 32], Error> {
+    let key_path = get_key_path()?;
+    if key_path.exists() {
+        let data = fs::read(&key_path)?;
+        if data.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&data);
+            secure_file(&key_path)?;
+            return Ok(key);
+        }
+    }
+
+    let key = Aes256Gcm::generate_key(&mut OsRng);
+    fs::write(&key_path, &key)?;
+    secure_file(&key_path)?;
+    Ok(key.into())
 }
 
 // ==================== 依赖检查与安装 ====================
-fn check_and_install_deps() -> io::Result<()> {
+fn check_and_install_deps() -> Result<(), Error> {
     println!("🔍 检查系统依赖工具...");
 
     let deps = [
@@ -166,7 +185,7 @@ fn is_command_available(cmd: &str) -> bool {
 
 // ==================== 日志系统 ====================
 static LOGGER_INIT: Once = Once::new();
-fn init_logger() -> io::Result<()> {
+fn init_logger() -> Result<(), Error> {
     let log_path = get_log_path()?;
     LOGGER_INIT.call_once(|| {
         let file = fs::OpenOptions::new()
@@ -205,8 +224,8 @@ fn log_action(action: &str, detail: &str) {
     println!("📝 [{}] {}", action, detail);
 }
 
-// ==================== 安全工具 (AES-GCM) ====================
-fn secure_file(path: &Path) -> io::Result<()> {
+// ==================== 安全工具 ====================
+fn secure_file(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     fs::set_permissions(path, Permissions::from_mode(0o600))?;
     Ok(())
@@ -217,8 +236,8 @@ fn encrypt_password(pwd: &str) -> String {
         return String::new();
     }
 
-    let key = GenericArray::from_slice(ENCRYPTION_KEY);
-    let cipher = Aes256Gcm::new(key);
+    let key = load_or_generate_key().unwrap_or_default();
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
     let encrypted = cipher.encrypt(&nonce, pwd.as_bytes()).unwrap_or_default();
@@ -230,13 +249,13 @@ fn encrypt_password(pwd: &str) -> String {
     hex::encode(result)
 }
 
-fn decrypt_password(encoded: &str) -> io::Result<String> {
+fn decrypt_password(encoded: &str) -> Result<String, Error> {
     if encoded.is_empty() {
         return Ok(String::new());
     }
 
-    let data = hex::decode(encoded)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "密码解密失败"))?;
+    let data =
+        hex::decode(encoded).map_err(|_| Error::new(ErrorKind::InvalidData, "密码解密失败"))?;
 
     if data.len() < 12 {
         return Ok(String::new());
@@ -244,28 +263,24 @@ fn decrypt_password(encoded: &str) -> io::Result<String> {
 
     let (nonce_bytes, ciphertext) = data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    let key = GenericArray::from_slice(ENCRYPTION_KEY);
-    let cipher = Aes256Gcm::new(key);
+    let key = load_or_generate_key()?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "密码解密失败"))?;
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "密码解密失败"))?;
 
-    String::from_utf8(plaintext)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "密码格式错误"))
+    String::from_utf8(plaintext).map_err(|_| Error::new(ErrorKind::InvalidData, "密码格式错误"))
 }
 
 // ==================== 工具释放 ====================
-fn release_tools() -> io::Result<()> {
+fn release_tools() -> Result<(), Error> {
     let dir = get_cache_dir()?;
     for (name, b64) in [("trzsz", TRZSZ_B64), ("trz", TRZ_B64), ("tsz", TSZ_B64)] {
         let path = dir.join(name);
         if !path.exists() {
             let decoded = general_purpose::STANDARD.decode(b64).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("解码 {} 失败: {}", name, e),
-                )
+                Error::new(ErrorKind::InvalidData, format!("解码 {} 失败: {}", name, e))
             })?;
             fs::write(&path, &decoded)?;
             let mut perms = fs::metadata(&path)?.permissions();
@@ -329,7 +344,7 @@ pub struct Host {
 }
 
 impl Host {
-    fn password(&self) -> io::Result<String> {
+    fn password(&self) -> Result<String, Error> {
         decrypt_password(&self.password_encrypted)
     }
 
@@ -345,26 +360,25 @@ pub struct Config {
 }
 
 // ==================== 配置管理 ====================
-fn load_config() -> io::Result<Config> {
+fn load_config() -> Result<Config, Error> {
     let p = get_config_path()?;
     if !p.exists() {
         return Ok(Config::default());
     }
 
-    let c = fs::read_to_string(&p)
-        .map_err(|e| io::Error::new(e.kind(), format!("读取配置失败: {}", e)))?;
+    let c =
+        fs::read_to_string(&p).map_err(|e| Error::new(e.kind(), format!("读取配置失败: {}", e)))?;
 
     serde_yaml::from_str(&c)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("解析配置失败: {}", e)))
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("解析配置失败: {}", e)))
 }
 
-fn save_config(cfg: &Config) -> io::Result<()> {
+fn save_config(cfg: &Config) -> Result<(), Error> {
     let p = get_config_path()?;
     let tmp = p.with_extension("yaml.tmp");
 
-    let content = serde_yaml::to_string(cfg).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("序列化配置失败: {}", e))
-    })?;
+    let content = serde_yaml::to_string(cfg)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("序列化配置失败: {}", e)))?;
 
     fs::write(&tmp, &content)?;
     secure_file(&tmp)?;
@@ -378,7 +392,7 @@ fn save_config(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
-fn backup_config() -> io::Result<()> {
+fn backup_config() -> Result<(), Error> {
     let s = get_config_path()?;
     if !s.exists() {
         println!("⚠️  配置文件不存在");
@@ -391,28 +405,28 @@ fn backup_config() -> io::Result<()> {
 }
 
 // ==================== 输入工具 ====================
-fn read_line(prompt: &str) -> io::Result<String> {
+fn read_line(prompt: &str) -> Result<String, Error> {
     print!("{}", prompt);
-    io::stdout().flush()?;
+    std::io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    std::io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_string())
 }
 
-fn read_password(prompt: &str) -> io::Result<String> {
+fn read_password(prompt: &str) -> Result<String, Error> {
     print!("{}", prompt);
-    io::stdout().flush()?;
+    std::io::stdout().flush()?;
 
     #[cfg(unix)]
-    if io::stdin().is_terminal() {
+    if std::io::stdin().is_terminal() {
         let _ = Command::new("stty").args(["-echo", "icanon"]).status();
     }
 
     let mut pwd = String::new();
-    io::stdin().read_line(&mut pwd)?;
+    std::io::stdin().read_line(&mut pwd)?;
 
     #[cfg(unix)]
-    if io::stdin().is_terminal() {
+    if std::io::stdin().is_terminal() {
         let _ = Command::new("stty").args(["echo", "icanon"]).status();
     }
 
@@ -428,26 +442,22 @@ fn confirm(prompt: &str) -> bool {
 }
 
 // ==================== IP 智能拼接 ====================
-fn normalize_ip(input: &str) -> io::Result<String> {
+fn normalize_ip(input: &str) -> Result<String, Error> {
     let input = input.trim();
     if input.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "IP 不能为空"));
+        return Err(Error::new(ErrorKind::InvalidInput, "IP 不能为空"));
     }
 
     if input.parse::<Ipv4Addr>().is_ok() {
         return Ok(input.to_string());
     }
 
-    let candidate = if input.starts_with(DEFAULT_IP_PREFIX) {
-        input.to_string()
-    } else {
-        format!("{}{}", DEFAULT_IP_PREFIX, input)
-    };
+    let candidate = format!("{}{}", DEFAULT_IP_PREFIX, input);
 
     if candidate.parse::<Ipv4Addr>().is_ok() {
         Ok(candidate)
     } else {
-        Err(io::Error::new(io::ErrorKind::InvalidInput, "IP 格式不合法"))
+        Err(Error::new(ErrorKind::InvalidInput, "IP 格式不合法"))
     }
 }
 
@@ -460,7 +470,10 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn select_host_interactive(cfg: &Config, host_type: Option<HostType>) -> io::Result<Option<usize>> {
+fn select_host_interactive(
+    cfg: &Config,
+    host_type: Option<HostType>,
+) -> Result<Option<usize>, Error> {
     let mut hosts: Vec<(usize, &Host)> = cfg
         .hosts
         .iter()
@@ -559,7 +572,7 @@ fn search_and_select(
     cfg: &Config,
     host_type: Option<HostType>,
     keyword: &str,
-) -> io::Result<Option<usize>> {
+) -> Result<Option<usize>, Error> {
     let results: Vec<(usize, &Host)> = cfg
         .hosts
         .iter()
@@ -608,7 +621,7 @@ fn search_and_select(
 }
 
 // ==================== 主机管理 ====================
-fn add_host(cfg: &mut Config) -> io::Result<()> {
+fn add_host(cfg: &mut Config) -> Result<(), Error> {
     println!("\n=== 添加新主机 ===");
 
     let host_type = match read_line("类型 (1=RDP / 2=SSH): ")?.as_str() {
@@ -618,7 +631,7 @@ fn add_host(cfg: &mut Config) -> io::Result<()> {
 
     let name = read_line("主机名称: ")?;
     if name.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "名称不能为空"));
+        return Err(Error::new(ErrorKind::InvalidInput, "名称不能为空"));
     }
 
     let ip_input = read_line(&format!("IP 地址 [{}]: ", DEFAULT_IP_PREFIX))?;
@@ -689,7 +702,7 @@ fn add_host(cfg: &mut Config) -> io::Result<()> {
     Ok(())
 }
 
-fn edit_host(cfg: &mut Config) -> io::Result<()> {
+fn edit_host(cfg: &mut Config) -> Result<(), Error> {
     let idx = match select_host_interactive(cfg, None)? {
         Some(i) => i,
         None => return Ok(()),
@@ -748,7 +761,7 @@ fn edit_host(cfg: &mut Config) -> io::Result<()> {
     Ok(())
 }
 
-fn delete_host(cfg: &mut Config) -> io::Result<()> {
+fn delete_host(cfg: &mut Config) -> Result<(), Error> {
     let idx = match select_host_interactive(cfg, None)? {
         Some(i) => i,
         None => return Ok(()),
@@ -769,18 +782,20 @@ fn delete_host(cfg: &mut Config) -> io::Result<()> {
 
 /// 展开路径中的 ~ 为用户家目录绝对路径
 fn expand_home_path(path: &str) -> String {
-    if path.starts_with("~/") {
+    if path.starts_with('~') {
         if let Some(home) = std::env::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                return path.replace("~/", &format!("{}/", home_str));
+            if path == "~" {
+                return home.to_string_lossy().to_string();
+            } else if path.starts_with("~/") {
+                return home.join(&path[2..]).to_string_lossy().to_string();
             }
         }
     }
     path.to_string()
 }
 
-/// 选择RDP增强功能
-fn select_rdp_features(_host_drive: &str) -> io::Result<Vec<String>> {
+/// 选择RDP增强功能（支持多显示器）
+fn select_rdp_features(_host_drive: &str) -> Result<Vec<String>, Error> {
     println!("\n{:=<50}", "");
     println!("{:^50}", "RDP 增强功能配置");
     println!("{:=<50}", "");
@@ -793,54 +808,51 @@ fn select_rdp_features(_host_drive: &str) -> io::Result<Vec<String>> {
     println!(" 【7】管理员/控制台模式");
     println!(" 【8】性能优化（低带宽流畅模式）");
     println!(" 【9】自动重连（断网自动恢复）");
+    println!(" 【A】多显示器模式（所有屏幕）");
+    println!(" 【S】单显示器模式（默认）");
     println!("{:-<50}", "");
-    println!("支持多选，空格分隔输入 示例：1 3 4 6");
+    println!("支持多选，空格分隔输入 示例：1 3 4 6 A");
     println!("{:-<50}", "\n");
 
     let input = read_line("请输入功能序号：")?;
-    // 调试打印：你输入的原始内容
     println!("你输入的选项：[{}]", input);
 
-    let selections: Vec<u8> = input
-        .split_whitespace()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let selections: Vec<String> = input.split_whitespace().map(|s| s.to_uppercase()).collect();
 
-    // 调试打印：解析后的选项列表
-    println!("🔍 解析后的选项：{:?}", selections);
-
-    // 基础参数
     let mut args = vec!["/cert:ignore".to_string()];
-
-    // 强制获取家目录
     let home_dir = std::env::home_dir().expect("获取家目录失败");
     let home_str = home_dir.to_str().expect("转换家目录失败");
-    println!("🔍 当前用户家目录：{}", home_str);
 
-    // ====================== 核心修复 ======================
-    args.push(format!("/drive:home,{}", home_str));
-    println!("已强制添加家目录映射参数");
-    // ======================================================
-
+    let mut added_home = false;
     for s in selections {
-        match s {
-            1 => args.push("/f".to_string()),
-            2 => args.push("/dynamic-resolution".to_string()),
-            3 => args.push("+clipboard".to_string()),
-            4 => args.push("/sound:sys:alsa".to_string()),
-            5 => args.push("/microphone:sys:alsa".to_string()),
-            6 => args.push(format!("/drive:home,{}", home_str)),
-            7 => args.push("/console".to_string()),
-            8 => {
+        match s.as_str() {
+            "1" => args.push("/f".to_string()),
+            "2" => args.push("/dynamic-resolution".to_string()),
+            "3" => args.push("+clipboard".to_string()),
+            "4" => args.push("/sound:sys:alsa".to_string()),
+            "5" => args.push("/microphone:sys:alsa".to_string()),
+            "6" => {
+                if !added_home {
+                    args.push(format!("/drive:home,{}", home_str));
+                    added_home = true;
+                }
+            }
+            "7" => args.push("/console".to_string()),
+            "8" => {
                 args.push("-wallpaper".to_string());
                 args.push("-themes".to_string());
             }
-            9 => args.push("+auto-reconnect".to_string()),
+            "9" => args.push("+auto-reconnect".to_string()),
+            "A" => args.push("/multimon".to_string()),
+            "S" => args.push("/mon:0".to_string()),
             _ => {}
         }
     }
 
-    // 打印最终参数
+    if !added_home {
+        args.push(format!("/drive:home,{}", home_str));
+    }
+
     println!("\n{:-<50}", "");
     println!("{:^50}", "已拼接 RDP 命令参数");
     println!("{:-<50}", "");
@@ -852,54 +864,38 @@ fn select_rdp_features(_host_drive: &str) -> io::Result<Vec<String>> {
     Ok(args)
 }
 
-fn spawn_daemon(cmd: &mut Command) -> io::Result<()> {
+/// 安全后台守护
+fn spawn_daemon(cmd: &mut Command) -> Result<(), Error> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
     #[cfg(unix)]
-    unsafe {
-        use libc::{fork, setsid};
-        // 第一次 fork
-        match fork() {
-            -1 => Err(io::Error::last_os_error()),
-            0 => {
-                setsid();
-                match fork() {
-                    -1 => std::process::exit(1),
-                    0 => {
-                        let _ = cmd.spawn();
-                        std::process::exit(0);
-                    }
-                    _ => std::process::exit(0),
-                }
-            }
-            _ => Ok(()),
-        }
+    {
+        let child = cmd.spawn()?;
+        let _ = child;
     }
-
     #[cfg(windows)]
     {
         cmd.spawn()?;
-        Ok(())
     }
+    Ok(())
 }
 
-fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
+/// RDP 连接
+fn connect_rdp(cfg: &mut Config) -> Result<(), Error> {
     let idx = match select_host_interactive(cfg, Some(HostType::Rdp))? {
         Some(i) => i,
         None => return Ok(()),
     };
 
-    // 🔥 修复：添加 as u64 类型强转
-    cfg.hosts[idx].last_connected_at = Local::now().timestamp() as u64;
+    cfg.hosts[idx].last_connected_at = Local::now().timestamp().max(0) as u64;
     save_config(cfg)?;
 
     let host = &cfg.hosts[idx];
     let rdp_args = select_rdp_features(&host.drive)?;
     let password = host.password()?;
 
-    // 格式化美观打印连接信息
     println!("\n{:=<50}", "");
     println!("{:^50}", "RDP 连接信息");
     println!("{:-<50}", "");
@@ -910,35 +906,32 @@ fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
 
     log_action("RDP 连接", &format!("{}@{}", host.username, host.ip));
 
-    // 依赖检查
     if !is_command_available("xfreerdp3") {
         eprintln!("\n❌ 未安装 xfreerdp3");
         eprintln!("✅ 安装命令: sudo apt install freerdp3-x11");
         return Ok(());
     }
 
-    // 构建 RDP 命令
     let mut cmd = Command::new("xfreerdp3");
     cmd.args(rdp_args)
-        .arg(format!("/v:{}", host.ip))
-        .arg(format!("/u:{}", host.username))
-        .arg(format!("/p:{}", password));
+        .arg(format!("/v:{}:{}", host.ip, host.port))
+        .arg(format!("/u:{}", host.username));
 
-    // 永久后台守护执行
+    if !password.is_empty() {
+        cmd.arg(format!("/p:{}", password));
+    }
+
     spawn_daemon(&mut cmd)?;
 
-    // 最终成功提示
     println!("\n{:-<50}", "");
-    println!("✅ RDP 已永久后台启动成功！");
-    println!("ℹ️  关闭终端/主程序不影响连接");
-    println!("ℹ️  直接关闭 RDP 窗口断开连接");
+    println!("✅ RDP 已后台启动！");
     println!("{:-<50}", "\n");
 
     Ok(())
 }
 
 // ==================== 批量检测主机端口连通性 ====================
-fn check_all_hosts_connectivity(cfg: &Config) -> io::Result<()> {
+fn check_all_hosts_connectivity(cfg: &Config) -> Result<(), Error> {
     let hosts = &cfg.hosts;
     if hosts.is_empty() {
         println!("📭 未添加任何主机！");
@@ -958,7 +951,7 @@ fn check_all_hosts_connectivity(cfg: &Config) -> io::Result<()> {
     for host in hosts {
         let addr = format!("{}:{}", host.ip, host.port);
         print!("检测 {} ({})...", host.ip, host.host_type.as_str());
-        io::stdout().flush()?;
+        std::io::stdout().flush()?;
 
         let socket_addr = match addr.parse::<SocketAddr>() {
             Ok(s) => s,
@@ -999,8 +992,8 @@ fn check_all_hosts_connectivity(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
-// ==================== SSH 连接（已优化提速） ====================
-fn connect_ssh(cfg: &mut Config) -> io::Result<()> {
+// ==================== SSH 连接 ====================
+fn connect_ssh(cfg: &mut Config) -> Result<(), Error> {
     let _ = release_tools();
 
     let idx = match select_host_interactive(cfg, Some(HostType::Ssh))? {
@@ -1008,7 +1001,7 @@ fn connect_ssh(cfg: &mut Config) -> io::Result<()> {
         None => return Ok(()),
     };
 
-    cfg.hosts[idx].last_connected_at = Local::now().timestamp() as u64;
+    cfg.hosts[idx].last_connected_at = Local::now().timestamp().max(0) as u64;
     let _ = save_config(cfg);
     let h = &cfg.hosts[idx].clone();
     let password = h.password().unwrap_or_default();
@@ -1071,7 +1064,7 @@ fn connect_ssh(cfg: &mut Config) -> io::Result<()> {
     Ok(())
 }
 
-fn check_remote_trzsz(h: &Host, password: &str, kh_path: &str) -> io::Result<bool> {
+fn check_remote_trzsz(h: &Host, password: &str, kh_path: &str) -> Result<bool, Error> {
     let out = Command::new("sshpass")
         .arg("-p")
         .arg(password)
@@ -1090,7 +1083,7 @@ fn check_remote_trzsz(h: &Host, password: &str, kh_path: &str) -> io::Result<boo
     Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "OK")
 }
 
-fn deploy_trzsz_to_remote(h: &Host, password: &str, kh_path: &str) -> io::Result<()> {
+fn deploy_trzsz_to_remote(h: &Host, password: &str, kh_path: &str) -> Result<(), Error> {
     let _ = run_ssh_cmd(h, password, "mkdir -p ~/.local/bin", kh_path);
 
     for (name, b64) in [("trz", TRZ_B64), ("tsz", TSZ_B64)] {
@@ -1106,7 +1099,12 @@ fn deploy_trzsz_to_remote(h: &Host, password: &str, kh_path: &str) -> io::Result
     Ok(())
 }
 
-fn run_ssh_cmd(h: &Host, password: &str, cmd_str: &str, kh_path: &str) -> io::Result<ExitStatus> {
+fn run_ssh_cmd(
+    h: &Host,
+    password: &str,
+    cmd_str: &str,
+    kh_path: &str,
+) -> Result<ExitStatus, Error> {
     Command::new("sshpass")
         .arg("-p")
         .arg(password)
@@ -1123,8 +1121,8 @@ fn run_ssh_cmd(h: &Host, password: &str, cmd_str: &str, kh_path: &str) -> io::Re
         .status()
 }
 
-// ==================== SCP 文件传输（带进度条+提速） ====================
-fn scp_transfer(cfg: &Config) -> io::Result<()> {
+// ==================== SCP 文件传输 ====================
+fn scp_transfer(cfg: &Config) -> Result<(), Error> {
     let idx = match select_host_interactive(cfg, Some(HostType::Ssh))? {
         Some(i) => i,
         None => return Ok(()),
@@ -1169,46 +1167,17 @@ fn scp_transfer(cfg: &Config) -> io::Result<()> {
         }
     );
 
+    let mut cmd = Command::new("sshpass");
+    cmd.arg("-p").arg(&password).arg("scp").args(scp_args);
+
     let status = if mode == "1" {
-        if has_pv {
-            // 修复：合并嵌套 format!
-            let cmd = format!(
-                "pv '{local}' | sshpass -p '{password}' scp {} - '{h}@{ip}:{rp}'",
-                scp_args.join(" "),
-                h = h.username,
-                ip = h.ip
-            );
-            Command::new("sh").arg("-c").arg(cmd).status()
-        } else {
-            Command::new("sshpass")
-                .arg("-p")
-                .arg(&password)
-                .arg("scp")
-                .args(scp_args) // 修复：移除不必要的 &
-                .arg(&local)
-                .arg(format!("{}@{}:{rp}", h.username, h.ip))
-                .status()
-        }
+        cmd.arg(&local)
+            .arg(format!("{}@{}:{rp}", h.username, h.ip))
+            .status()
     } else {
-        if has_pv {
-            // 修复：合并嵌套 format!
-            let cmd = format!(
-                "sshpass -p '{password}' scp {} {h}@{ip}:{rp} - | pv > '{local}'",
-                scp_args.join(" "),
-                h = h.username,
-                ip = h.ip
-            );
-            Command::new("sh").arg("-c").arg(cmd).status()
-        } else {
-            Command::new("sshpass")
-                .arg("-p")
-                .arg(&password)
-                .arg("scp")
-                .args(scp_args) // 修复：移除不必要的 &
-                .arg(format!("{}@{}:{rp}", h.username, h.ip))
-                .arg(&local)
-                .status()
-        }
+        cmd.arg(format!("{}@{}:{rp}", h.username, h.ip))
+            .arg(&local)
+            .status()
     };
 
     if status?.success() {
@@ -1219,8 +1188,9 @@ fn scp_transfer(cfg: &Config) -> io::Result<()> {
 
     Ok(())
 }
+
 // ==================== 批量执行 ====================
-fn batch_exec(cfg: &Config) -> io::Result<()> {
+fn batch_exec(cfg: &Config) -> Result<(), Error> {
     println!("\n=== 批量执行命令 ===");
 
     let kh_path = get_known_hosts_path()?;
@@ -1267,7 +1237,7 @@ fn batch_exec(cfg: &Config) -> io::Result<()> {
     println!("\n🚀 开始执行...\n");
     for h in list {
         print!("[{}] ", h.name);
-        io::stdout().flush()?;
+        std::io::stdout().flush()?;
 
         let pwd = h.password().unwrap_or_default();
         if !pwd.is_empty() {
@@ -1303,7 +1273,7 @@ fn batch_exec(cfg: &Config) -> io::Result<()> {
 }
 
 // ==================== 配置菜单 ====================
-fn config_menu(_cfg: &mut Config) -> io::Result<()> {
+fn config_menu(_cfg: &mut Config) -> Result<(), Error> {
     loop {
         println!("\n=== 配置管理 ===");
         println!("1. 备份配置");
@@ -1317,6 +1287,7 @@ fn config_menu(_cfg: &mut Config) -> io::Result<()> {
                 println!("SSH 指纹: {}", get_known_hosts_path()?.display());
                 println!("缓存工具: {}", get_cache_dir()?.display());
                 println!("日志文件: {}", get_log_path()?.display());
+                println!("安全密钥: {}", get_key_path()?.display());
             }
             s if s == "0" => break,
             _ => println!("❌ 无效选择"),
@@ -1327,7 +1298,7 @@ fn config_menu(_cfg: &mut Config) -> io::Result<()> {
 }
 
 // ==================== 主循环 ====================
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Error> {
     check_and_install_deps()?;
     init_logger()?;
     info!("=== remote-manager 启动 ===");
@@ -1335,7 +1306,6 @@ fn main() -> io::Result<()> {
     println!("🚀 remote-manager 稳定版");
     println!("📂 数据目录: {}", get_base_dir()?.display());
 
-    // 修复：unwrap_or_ → unwrap_or_else
     let mut cfg = load_config().unwrap_or_else(|e| {
         error!("配置加载失败: {}", e);
         Config::default()
@@ -1351,7 +1321,7 @@ fn main() -> io::Result<()> {
         println!("6. SCP 文件传输");
         println!("7. 批量执行命令");
         println!("8. 配置管理");
-        println!("9. 批量检测主机连通性 ✅");
+        println!("9. 批量检测主机连通性");
         println!("0. 退出");
         println!("{:=^55}", "");
 
