@@ -1,0 +1,1213 @@
+use base64::engine::{general_purpose, Engine as _};
+use chrono::Local;
+use log::{error, info};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, Permissions};
+use std::io::{self, IsTerminal, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Once;
+use std::time::Duration;
+
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
+use generic_array::GenericArray;
+
+// ==================== 全局常量 ====================
+const APP_DIR: &str = "remote-manager-data";
+const CONFIG_DIR: &str = "config";
+const CACHE_DIR: &str = "cache";
+const SSH_DIR: &str = "ssh";
+const LOG_DIR: &str = "logs";
+const CONFIG_FILE: &str = "config.yaml";
+const LOG_FILE: &str = "remote-manager.log";
+const SSH_CONNECT_TIMEOUT: &str = "2";
+const CONNECT_TIMEOUT_SECS: u64 = 2;
+const PAGE_SIZE: usize = 15;
+const DEFAULT_IP_PREFIX: &str = "192.168.";
+const DEFAULT_RDP_USER: &str = "Administrator";
+
+const ENCRYPTION_KEY: &[u8; 32] = b"12345678901234561234567890123456";
+
+// ==================== 内置二进制文件 ====================
+const TRZSZ_B64: &[u8] = include_bytes!("../trzsz.b64");
+const TRZ_B64: &[u8] = include_bytes!("../trz.b64");
+const TSZ_B64: &[u8] = include_bytes!("../tsz.b64");
+
+// ==================== 路径管理 ====================
+fn get_base_dir() -> io::Result<PathBuf> {
+    let exe_path = std::env::current_exe()
+        .map_err(|e| io::Error::new(e.kind(), format!("无法获取程序路径: {}", e)))?;
+
+    let bin_dir = exe_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定程序目录"))?
+        .to_path_buf();
+
+    let app_dir = bin_dir.join(APP_DIR);
+    if !app_dir.exists() {
+        fs::create_dir_all(&app_dir)?;
+        #[cfg(unix)]
+        fs::set_permissions(&app_dir, Permissions::from_mode(0o755))?;
+    }
+    Ok(app_dir)
+}
+
+fn mk_dir(name: &str) -> io::Result<PathBuf> {
+    let p = get_base_dir()?.join(name);
+    if !p.exists() {
+        fs::create_dir_all(&p)?;
+    }
+    Ok(p)
+}
+
+fn get_config_dir() -> io::Result<PathBuf> {
+    mk_dir(CONFIG_DIR)
+}
+
+fn get_cache_dir() -> io::Result<PathBuf> {
+    mk_dir(CACHE_DIR)
+}
+
+fn get_ssh_dir() -> io::Result<PathBuf> {
+    mk_dir(SSH_DIR)
+}
+
+fn get_log_dir() -> io::Result<PathBuf> {
+    mk_dir(LOG_DIR)
+}
+
+fn get_known_hosts_path() -> io::Result<PathBuf> {
+    get_ssh_dir().map(|p| p.join("known_hosts"))
+}
+
+fn get_config_path() -> io::Result<PathBuf> {
+    get_config_dir().map(|p| p.join(CONFIG_FILE))
+}
+
+fn get_log_path() -> io::Result<PathBuf> {
+    get_log_dir().map(|p| p.join(LOG_FILE))
+}
+
+fn get_home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("~"))
+}
+
+// ==================== 【启动就检测所有依赖】 ====================
+fn check_all_dependencies() -> io::Result<()> {
+    println!(" 启动检测：所有必需组件...");
+
+    let required = [
+        ("sshpass", "SSH 密码登录"),
+        ("xfreerdp3", "RDP 远程桌面"),
+        ("scp", "文件传输"),
+        ("base64", "编码工具"),
+        ("pv", "进度条显示"),
+    ];
+
+    let mut missing = Vec::new();
+
+    for (cmd, name) in required {
+        if !is_command_available(cmd) {
+            println!(" 缺失: {} ({})", cmd, name);
+            missing.push(cmd);
+        } else {
+            println!(" 正常: {} ({})", cmd, name);
+        }
+    }
+
+    if !missing.is_empty() {
+        eprintln!("\n 缺少必需工具，请安装：");
+        eprintln!("sudo apt install -y sshpass freerdp3 scp coreutils pv");
+        std::process::exit(1);
+    }
+
+    println!(" 所有依赖检测通过！\n");
+    Ok(())
+}
+
+fn is_command_available(cmd: &str) -> bool {
+    #[cfg(unix)]
+    let status = Command::new("which")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    #[cfg(windows)]
+    let status = Command::new("where")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
+// ==================== 日志系统 ====================
+static LOGGER_INIT: Once = Once::new();
+fn init_logger() -> io::Result<()> {
+    let log_path = get_log_path()?;
+    LOGGER_INIT.call_once(|| {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok();
+
+        if let Some(f) = file {
+            let _ = env_logger::builder()
+                .format(|buf, record| {
+                    writeln!(
+                        buf,
+                        "[{}] [{}] {}",
+                        Local::now().format("%Y-%m-%d %H:%M:%S"),
+                        record.level(),
+                        record.args()
+                    )
+                })
+                .target(env_logger::Target::Pipe(Box::new(f)))
+                .filter_level(log::LevelFilter::Info)
+                .try_init();
+        }
+    });
+
+    #[cfg(unix)]
+    if log_path.exists() {
+        let _ = fs::set_permissions(&log_path, Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
+fn log_action(action: &str, detail: &str) {
+    info!("{}: {}", action, detail);
+    println!(" [{}] {}", action, detail);
+}
+
+// ==================== 密码加解密 ====================
+fn secure_file(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn encrypt_password(pwd: &str) -> String {
+    if pwd.is_empty() {
+        return String::new();
+    }
+    let key = GenericArray::from_slice(ENCRYPTION_KEY);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let encrypted = cipher.encrypt(&nonce, pwd.as_bytes()).unwrap_or_default();
+    let mut result = Vec::new();
+    result.extend_from_slice(&nonce);
+    result.extend_from_slice(&encrypted);
+    hex::encode(result)
+}
+
+fn decrypt_password(encoded: &str) -> io::Result<String> {
+    if encoded.is_empty() {
+        return Ok(String::new());
+    }
+    let data = hex::decode(encoded)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "密码解密失败"))?;
+    if data.len() < 12 {
+        return Ok(String::new());
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let key = GenericArray::from_slice(ENCRYPTION_KEY);
+    let cipher = Aes256Gcm::new(key);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "密码解密失败"))?;
+    String::from_utf8(plaintext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "密码格式错误"))
+}
+
+// ==================== 释放 trzsz 工具 ====================
+fn release_tools() -> io::Result<()> {
+    let dir = get_cache_dir()?;
+    for (name, b64) in [("trzsz", TRZSZ_B64), ("trz", TRZ_B64), ("tsz", TSZ_B64)] {
+        let path = dir.join(name);
+        if !path.exists() {
+            let decoded = general_purpose::STANDARD.decode(b64).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("工具解码失败: {}", e))
+            })?;
+            fs::write(&path, &decoded)?;
+            let mut perms = fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms)?;
+        }
+    }
+    Ok(())
+}
+
+// ==================== 主机类型枚举 ====================
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum HostType {
+    Rdp,
+    Ssh,
+}
+
+impl HostType {
+    fn default_port(&self) -> u16 {
+        match self {
+            HostType::Rdp => 3389,
+            HostType::Ssh => 50022,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            HostType::Rdp => "RDP",
+            HostType::Ssh => "SSH",
+        }
+    }
+}
+
+// ==================== 主机结构体 ====================
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Host {
+    name: String,
+    ip: String,
+    port: u16,
+    username: String,
+    #[serde(default)]
+    password_encrypted: String,
+    #[serde(default)]
+    drive: String,
+    #[serde(default)]
+    key_path: String,
+    host_type: HostType,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    last_connected_at: u64,
+}
+
+impl Host {
+    fn password(&self) -> io::Result<String> {
+        decrypt_password(&self.password_encrypted)
+    }
+
+    fn set_password(&mut self, pwd: &str) {
+        self.password_encrypted = encrypt_password(pwd);
+    }
+}
+
+// ==================== 配置结构体 ====================
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct Config {
+    #[serde(default)]
+    hosts: Vec<Host>,
+}
+
+// ==================== 配置加载/保存 ====================
+fn load_config() -> io::Result<Config> {
+    let p = get_config_path()?;
+    if !p.exists() {
+        return Ok(Config::default());
+    }
+    let c = fs::read_to_string(&p)
+        .map_err(|e| io::Error::new(e.kind(), format!("配置读取失败: {}", e)))?;
+    serde_yaml::from_str(&c)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("配置解析失败: {}", e)))
+}
+
+fn save_config(cfg: &Config) -> io::Result<()> {
+    let p = get_config_path()?;
+    let tmp = p.with_extension("yaml.tmp");
+    let content = serde_yaml::to_string(cfg).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("配置序列化失败: {}", e))
+    })?;
+    fs::write(&tmp, &content)?;
+    secure_file(&tmp)?;
+    if p.exists() {
+        let backup = p.with_extension("yaml.bak");
+        let _ = fs::copy(&p, backup);
+    }
+    fs::rename(&tmp, &p)?;
+    Ok(())
+}
+
+fn backup_config() -> io::Result<()> {
+    let s = get_config_path()?;
+    if !s.exists() {
+        println!("  配置文件不存在");
+        return Ok(());
+    }
+    let d = s.with_extension(format!("yaml.{}.bak", Local::now().format("%Y%m%d_%H%M%S")));
+    fs::copy(&s, &d)?;
+    println!(" 配置已备份: {}", d.display());
+    Ok(())
+}
+
+// ==================== 输入工具 ====================
+fn read_line(prompt: &str) -> io::Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn read_password(prompt: &str) -> io::Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+
+    #[cfg(unix)]
+    if io::stdin().is_terminal() {
+        let _ = Command::new("stty").args(["-echo", "icanon"]).status();
+    }
+
+    let mut pwd = String::new();
+    io::stdin().read_line(&mut pwd)?;
+
+    #[cfg(unix)]
+    if io::stdin().is_terminal() {
+        let _ = Command::new("stty").args(["echo", "icanon"]).status();
+    }
+
+    println!();
+    Ok(pwd.trim().to_string())
+}
+
+fn confirm(prompt: &str) -> bool {
+    match read_line(&format!("{} [y/N]: ", prompt)) {
+        Ok(ans) => matches!(ans.to_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
+}
+
+// ==================== IP 格式化 ====================
+fn normalize_ip(input: &str) -> io::Result<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "IP 不能为空"));
+    }
+    if input.parse::<Ipv4Addr>().is_ok() {
+        return Ok(input.to_string());
+    }
+    let candidate = if input.starts_with(DEFAULT_IP_PREFIX) {
+        input.to_string()
+    } else {
+        format!("{}{}", DEFAULT_IP_PREFIX, input)
+    };
+    if candidate.parse::<Ipv4Addr>().is_ok() {
+        Ok(candidate)
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidInput, "IP 格式不合法"))
+    }
+}
+
+// ==================== 主机选择界面 ====================
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max - 3])
+    }
+}
+
+fn select_host_interactive(cfg: &Config, host_type: Option<HostType>) -> io::Result<Option<usize>> {
+    let mut hosts: Vec<(usize, &Host)> = cfg
+        .hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| host_type.is_none_or(|t| h.host_type == t))
+        .collect();
+
+    hosts.sort_by_key(|(_, host)| std::cmp::Reverse(host.last_connected_at));
+
+    if hosts.is_empty() {
+        println!(" 没有可用主机");
+        return Ok(None);
+    }
+
+    let total = hosts.len();
+    let total_pages = (total - 1) / PAGE_SIZE + 1;
+    let mut page = 0;
+
+    loop {
+        let start = page * PAGE_SIZE;
+        let end = std::cmp::min(start + PAGE_SIZE, total);
+        let current = &hosts[start..end];
+
+        println!(
+            "\n=== 主机列表 [第 {}/{} 页，共 {} 台] ===",
+            page + 1,
+            total_pages,
+            total
+        );
+        println!(
+            "{:<4} {:<8} {:<20} {:<16} {:<6} {:<12} 最近连接",
+            "ID", "类型", "名称", "地址", "端口", "用户"
+        );
+        println!("{}", "─".repeat(85));
+
+        for (i, (_, h)) in current.iter().enumerate() {
+            let last = if h.last_connected_at > 0 {
+                chrono::DateTime::from_timestamp(h.last_connected_at as i64, 0)
+                    .map(|dt| dt.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default()
+            } else {
+                "从未".to_string()
+            };
+
+            println!(
+                "{:<4} {:<8} {:<20} {:<16} {:<6} {:<12} {}",
+                i + 1,
+                h.host_type.as_str(),
+                truncate(&h.name, 20),
+                truncate(&h.ip, 16),
+                h.port,
+                truncate(&h.username, 12),
+                last
+            );
+        }
+
+        let prompt = if total_pages > 1 {
+            "输入序号 (0 取消，p 上页，n 下页，s 搜索): "
+        } else {
+            "输入序号 (0 取消，s 搜索): "
+        };
+
+        match read_line(prompt)? {
+            s if s == "0" => return Ok(None),
+            s if s.eq_ignore_ascii_case("p") => {
+                if page > 0 {
+                    page -= 1;
+                } else {
+                    println!("  已经是第一页");
+                }
+            }
+            s if s.eq_ignore_ascii_case("n") => {
+                if page + 1 < total_pages {
+                    page += 1;
+                } else {
+                    println!("  已经是最后一页");
+                }
+            }
+            s if s.eq_ignore_ascii_case("s") => {
+                let kw = read_line(" 搜索关键词(名称/IP): ")?;
+                return search_and_select(cfg, host_type, &kw);
+            }
+            s => {
+                if let Ok(idx) = s.parse::<usize>() {
+                    if idx > 0 && idx <= current.len() {
+                        return Ok(Some(current[idx - 1].0));
+                    }
+                }
+                println!(" 无效输入");
+            }
+        }
+    }
+}
+
+fn search_and_select(
+    cfg: &Config,
+    host_type: Option<HostType>,
+    keyword: &str,
+) -> io::Result<Option<usize>> {
+    let results: Vec<(usize, &Host)> = cfg
+        .hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| host_type.is_none_or(|t| h.host_type == t))
+        .filter(|(_, h)| keyword.is_empty() || h.name.contains(keyword) || h.ip.contains(keyword))
+        .collect();
+
+    if results.is_empty() {
+        println!(" 没有找到匹配的主机");
+        return Ok(None);
+    }
+
+    println!("\n=== 搜索结果 ({} 台) ===", results.len());
+    println!(
+        "{:<4} {:<8} {:<20} {:<16} {:<6} {:<12}",
+        "ID", "类型", "名称", "地址", "端口", "用户"
+    );
+    println!("{}", "─".repeat(75));
+
+    for (i, (_, h)) in results.iter().enumerate() {
+        println!(
+            "{:<4} {:<8} {:<20} {:<16} {:<6} {:<12}",
+            i + 1,
+            h.host_type.as_str(),
+            truncate(&h.name, 20),
+            truncate(&h.ip, 16),
+            h.port,
+            truncate(&h.username, 12)
+        );
+    }
+
+    loop {
+        match read_line("请输入序号 (0 返回): ")? {
+            s if s == "0" => return Ok(None),
+            s => {
+                if let Ok(idx) = s.parse::<usize>() {
+                    if idx > 0 && idx <= results.len() {
+                        return Ok(Some(results[idx - 1].0));
+                    }
+                }
+                println!(" 无效序号");
+            }
+        }
+    }
+}
+
+// ==================== 添加主机 ====================
+fn add_host(cfg: &mut Config) -> io::Result<()> {
+    println!("\n=== 添加新主机 ===");
+
+    let host_type = match read_line("协议类型 (1=RDP / 2=SSH): ")?.as_str() {
+        "1" => HostType::Rdp,
+        _ => HostType::Ssh,
+    };
+
+    let name = read_line("主机名称: ")?;
+    if name.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "名称不能为空"));
+    }
+
+    let ip_input = read_line(&format!("IP 地址 [{}]: ", DEFAULT_IP_PREFIX))?;
+    let ip = normalize_ip(&ip_input)?;
+
+    let port = read_line(&format!("端口 (默认 {}): ", host_type.default_port()))?
+        .parse::<u16>()
+        .unwrap_or_else(|_| host_type.default_port());
+
+    const DEFAULT_SSH_USER: &str = "meitaol";
+
+    let username_default = if host_type == HostType::Rdp {
+        DEFAULT_RDP_USER
+    } else {
+        DEFAULT_SSH_USER
+    };
+
+    let password = read_password("密码 (留空=密钥认证): ")?;
+
+    let mut drive = String::new();
+    let mut key_path = String::new();
+
+    match host_type {
+        HostType::Rdp => {
+            drive = read_line("本地共享目录 (回车=家目录): ")?;
+            if drive.is_empty() {
+                drive = get_home_dir().to_string_lossy().to_string();
+            }
+        }
+        HostType::Ssh => {
+            key_path = read_line("SSH 密钥 (回车=~/.ssh/id_ed25519): ")?;
+            if key_path.is_empty() {
+                key_path = get_home_dir()
+                    .join(".ssh/id_ed25519")
+                    .to_string_lossy()
+                    .to_string();
+            }
+        }
+    }
+
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut host = Host {
+        name,
+        ip,
+        port,
+        username,
+        password_encrypted: String::new(),
+        drive,
+        key_path,
+        host_type,
+        created_at: now.clone(),
+        updated_at: now,
+        last_connected_at: 0,
+    };
+
+    if !password.is_empty() {
+        host.set_password(&password);
+    }
+
+    cfg.hosts.push(host);
+    save_config(cfg)?;
+    log_action("添加主机", &cfg.hosts.last().unwrap().name);
+    println!(" 主机添加成功！");
+    Ok(())
+}
+
+// ==================== 编辑主机 ====================
+fn edit_host(cfg: &mut Config) -> io::Result<()> {
+    let idx = match select_host_interactive(cfg, None)? {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
+    let mut host = cfg.hosts[idx].clone();
+    let host_name = host.name.clone();
+    println!("\n=== 编辑主机: {} ===", host.name);
+
+    let new_name = read_line(&format!("名称 [{}]: ", host.name))?;
+    let new_ip = read_line(&format!("IP [{}]: ", host.ip))?;
+    let new_port = read_line(&format!("端口 [{}]: ", host.port))?;
+    let new_user = read_line(&format!("用户名 [{}]: ", host.username))?;
+
+    if !new_name.is_empty() {
+        host.name = new_name;
+    }
+    if !new_ip.is_empty() {
+        host.ip = normalize_ip(&new_ip)?;
+    }
+    if let Ok(p) = new_port.parse::<u16>() {
+        host.port = p;
+    }
+    if !new_user.is_empty() {
+        host.username = new_user;
+    }
+
+    if confirm("是否更新密码？") {
+        let pwd = read_password("新密码 (留空=清空): ")?;
+        if pwd.is_empty() {
+            host.password_encrypted.clear();
+        } else {
+            host.set_password(&pwd);
+        }
+    }
+
+    match host.host_type {
+        HostType::Rdp => {
+            let nd = read_line(&format!("共享目录 [{}]: ", host.drive))?;
+            if !nd.is_empty() {
+                host.drive = nd;
+            }
+        }
+        HostType::Ssh => {
+            let nk = read_line(&format!("密钥路径 [{}]: ", host.key_path))?;
+            if !nk.is_empty() {
+                host.key_path = nk;
+            }
+        }
+    }
+
+    host.updated_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    cfg.hosts[idx] = host;
+    save_config(cfg)?;
+    log_action("编辑主机", &host_name);
+    println!(" 编辑完成！");
+    Ok(())
+}
+
+// ==================== 删除主机 ====================
+fn delete_host(cfg: &mut Config) -> io::Result<()> {
+    let idx = match select_host_interactive(cfg, None)? {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
+    let name = cfg.hosts[idx].name.clone();
+    if !confirm(&format!("确认删除主机 {}？", name)) {
+        println!(" 已取消");
+        return Ok(());
+    }
+
+    cfg.hosts.remove(idx);
+    save_config(cfg)?;
+    log_action("删除主机", &name);
+    println!(" 已删除");
+    Ok(())
+}
+
+// ==================== 【RDP 显示器模式选择】 ====================
+fn select_monitor_mode() -> &'static str {
+    loop {
+        println!("\n🖥️  请选择显示器模式：");
+        println!("1. 单显示器");
+        println!("2. 多显示器");
+        match read_line("请选择 [1/2]: ").unwrap_or_default().as_str() {
+            "1" => return "single",
+            "2" => return "multi",
+            _ => println!(" 请输入 1 或 2"),
+        }
+    }
+}
+
+// ==================== 【RDP 参数】 ====================
+fn build_rdp_args(host: &Host) -> Vec<String> {
+    let mode = select_monitor_mode();
+    let mut args = vec![
+        "/cert:ignore".to_string(),
+        "/dynamic-resolution".to_string(),
+        "+clipboard".to_string(),
+        "/sound:sys:alsa".to_string(),
+        "/microphone:sys:alsa".to_string(),
+        "-wallpaper".to_string(),
+        "-themes".to_string(),
+        "+auto-reconnect".to_string(),
+        "/mouse:relative:on".to_string(),
+    ];
+
+    // ==============================================
+    //  单显示器 = 全屏（-f）
+    //  多显示器 = 扩展屏（/multimon）
+    // ==============================================
+    if mode == "multi" {
+        args.push("/multimon".to_string());
+    } else {
+        args.push("-f".to_string()); // 🔥 这里就是单屏全屏
+    }
+
+    if !host.drive.is_empty() && Path::new(&host.drive).exists() {
+        args.push(format!("/drive:home,{}", host.drive));
+    }
+
+    args.push(format!("/u:{}", host.username));
+    args.push(format!("/p:{}", host.password().unwrap_or_default()));
+    args.push(format!("/v:{}:{}", host.ip, host.port));
+
+    println!("\n 启动 RDP...");
+    args
+}
+fn spawn_daemon(cmd: &mut Command) -> io::Result<()> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    unsafe {
+        use libc::{fork, setsid};
+        match fork() {
+            -1 => Err(io::Error::last_os_error()),
+            0 => {
+                setsid();
+                match fork() {
+                    -1 => std::process::exit(1),
+                    0 => {
+                        let _ = cmd.spawn();
+                        std::process::exit(0);
+                    }
+                    _ => std::process::exit(0),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        cmd.spawn()?;
+        Ok(())
+    }
+}
+
+// ==================== 连接 RDP ====================
+fn connect_rdp(cfg: &mut Config) -> io::Result<()> {
+    let idx = match select_host_interactive(cfg, Some(HostType::Rdp))? {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
+    cfg.hosts[idx].last_connected_at = Local::now().timestamp() as u64;
+    save_config(cfg)?;
+    let host = &cfg.hosts[idx];
+
+    let args = build_rdp_args(host);
+    let mut cmd = Command::new("xfreerdp3");
+    cmd.args(args);
+
+    log_action("RDP 连接", &format!("{}@{}", host.username, host.ip));
+    spawn_daemon(&mut cmd)?;
+    println!(" RDP 已启动！");
+    Ok(())
+}
+
+// ==================== 批量检测端口 ====================
+fn check_all_hosts_connectivity(cfg: &Config) -> io::Result<()> {
+    let hosts = &cfg.hosts;
+    if hosts.is_empty() {
+        println!(" 无主机可检测");
+        return Ok(());
+    }
+
+    println!(
+        "\n 批量检测主机端口连通性 (超时 {} 秒)",
+        CONNECT_TIMEOUT_SECS
+    );
+    println!("{}", "─".repeat(60));
+
+    let mut success_ips = Vec::new();
+    let mut failed_ips = Vec::new();
+    let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
+
+    for host in hosts {
+        let addr = format!("{}:{}", host.ip, host.port);
+        print!("检测 {} ({})...", host.ip, host.host_type.as_str());
+        io::stdout().flush()?;
+
+        match addr.parse::<SocketAddr>() {
+            Ok(s) => match TcpStream::connect_timeout(&s, timeout) {
+                Ok(_) => {
+                    println!(" 在线");
+                    success_ips.push(host.ip.clone());
+                }
+                Err(_) => {
+                    println!(" 离线");
+                    failed_ips.push(host.ip.clone());
+                }
+            },
+            Err(_) => {
+                println!(" IP 格式错误");
+                failed_ips.push(host.ip.clone());
+            }
+        }
+    }
+
+    println!("{}", "─".repeat(60));
+    println!(
+        " 检测完成：总计 {} 台 | 在线 {} 台 | 离线 {} 台",
+        hosts.len(),
+        success_ips.len(),
+        failed_ips.len()
+    );
+
+    if !success_ips.is_empty() {
+        println!(" 在线：{}", success_ips.join(" | "));
+    }
+    if !failed_ips.is_empty() {
+        println!(" 离线：{}", failed_ips.join(" | "));
+    }
+
+    Ok(())
+}
+
+// ==================== 连接 SSH ====================
+fn connect_ssh(cfg: &mut Config) -> io::Result<()> {
+    let _ = release_tools();
+
+    let idx = match select_host_interactive(cfg, Some(HostType::Ssh))? {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
+    cfg.hosts[idx].last_connected_at = Local::now().timestamp() as u64;
+    let _ = save_config(cfg);
+    let h = &cfg.hosts[idx].clone();
+    let password = h.password().unwrap_or_default();
+
+    let kh_path = get_known_hosts_path()?;
+    let kh_path_str = kh_path.to_string_lossy();
+
+    log_action("SSH 连接", &format!("{}@{}", h.username, h.ip));
+
+    if !password.is_empty() {
+        if let Ok(false) = check_remote_trzsz(h, &password, &kh_path_str) {
+            println!(" 自动部署 trzsz 文件传输工具...");
+            let _ = deploy_trzsz_to_remote(h, &password, &kh_path_str);
+        }
+    }
+
+    let trzsz_bin = get_cache_dir()?.join("trzsz");
+    let mut cmd = Command::new(&trzsz_bin);
+    cmd.arg("ssh")
+        .arg("-p")
+        .arg(h.port.to_string())
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", SSH_CONNECT_TIMEOUT))
+        .arg("-o")
+        .arg("CheckHostIP=no")
+        .arg("-o")
+        .arg("GSSAPIAuthentication=no")
+        .arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh_path_str))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+
+    let has_key = !h.key_path.is_empty() && Path::new(&h.key_path).exists();
+    if has_key {
+        cmd.arg("-i")
+            .arg(&h.key_path)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("PreferredAuthentications=publickey,password");
+    } else {
+        cmd.arg("-o")
+            .arg("PreferredAuthentications=password,publickey");
+    }
+
+    if !password.is_empty() {
+        cmd.env("SSHPASS", &password).env("TRZSZ_PWD", &password);
+    }
+
+    cmd.arg(format!("{}@{}", h.username, h.ip));
+    println!(" 连接中... 退出按 Ctrl+]");
+
+    let status = cmd.status()?;
+    if !status.success() && status.code() == Some(255) {
+        eprintln!(" 连接失败：IP/端口/密码错误");
+    }
+
+    Ok(())
+}
+
+fn check_remote_trzsz(h: &Host, pwd: &str, kh: &str) -> io::Result<bool> {
+    let out = Command::new("sshpass")
+        .arg("-p")
+        .arg(pwd)
+        .arg("ssh")
+        .args(["-p", &h.port.to_string(), "-o", "ConnectTimeout=2"])
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(format!("{}@{}", h.username, h.ip))
+        .arg("test -x ~/.local/bin/trz && test -x ~/.local/bin/tsz && echo OK")
+        .output()?;
+
+    Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "OK")
+}
+
+fn deploy_trzsz_to_remote(h: &Host, pwd: &str, kh: &str) -> io::Result<()> {
+    let _ = run_ssh_cmd(h, pwd, "mkdir -p ~/.local/bin", kh);
+
+    for (name, b64) in [("trz", TRZ_B64), ("tsz", TSZ_B64)] {
+        let b64_str = general_purpose::STANDARD.encode(b64);
+        let cmd = format!(
+            "echo '{}' | base64 -d > ~/.local/bin/{} && chmod +x ~/.local/bin/{}",
+            b64_str, name, name
+        );
+        let _ = run_ssh_cmd(h, pwd, &cmd, kh);
+    }
+
+    println!(" trzsz 部署完成");
+    Ok(())
+}
+
+fn run_ssh_cmd(h: &Host, pwd: &str, cmd: &str, kh: &str) -> io::Result<ExitStatus> {
+    Command::new("sshpass")
+        .arg("-p")
+        .arg(pwd)
+        .arg("ssh")
+        .args(["-p", &h.port.to_string(), "-o", "ConnectTimeout=5"])
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(format!("{}@{}", h.username, h.ip))
+        .arg(cmd)
+        .status()
+}
+
+// ==================== SCP 传输 ====================
+fn scp_transfer(cfg: &Config) -> io::Result<()> {
+    let idx = match select_host_interactive(cfg, Some(HostType::Ssh))? {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
+    let h = &cfg.hosts[idx];
+    let pwd = h.password().unwrap_or_default();
+    let kh_path = get_known_hosts_path()?;
+
+    let mode = read_line("传输方向 (1=上传 / 2=下载): ")?;
+    let local = read_line("本地路径: ")?;
+    let remote = read_line("远程路径 (默认 ~/): ")?;
+    let rp = if remote.is_empty() { "~/" } else { &remote };
+
+    // 基础 SCP 参数
+    let mut cmd = Command::new("sshpass");
+    cmd.arg("-p").arg(&pwd);
+    cmd.arg("scp")
+        .arg("-P")
+        .arg(h.port.to_string())
+        .arg("-o")
+        .arg("ConnectTimeout=2")
+        .arg("-o")
+        .arg("CheckHostIP=no")
+        .arg("-o")
+        .arg("GSSAPIAuthentication=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh_path.to_string_lossy()))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-r"); // 支持文件夹
+
+    // 上传：本地 → 远程
+    if mode == "1" {
+        cmd.arg(&local);
+        cmd.arg(format!("{}@{}:{}", h.username, h.ip, rp));
+    }
+    // 下载：远程 → 本地
+    else {
+        cmd.arg(format!("{}@{}:{}", h.username, h.ip, rp));
+        cmd.arg(&local);
+    }
+
+    println!(" 开始传输...");
+    let status = cmd.status()?;
+
+    if status.success() {
+        println!(" 传输成功！");
+    } else {
+        eprintln!(" 传输失败");
+    }
+
+    Ok(())
+}
+
+// ==================== 【批量执行 - 打印命令】 ====================
+fn batch_exec(cfg: &Config) -> io::Result<()> {
+    println!("\n=== 批量执行命令 ===");
+
+    let kh_path = get_known_hosts_path()?;
+    let kh = kh_path.to_string_lossy();
+    let targets: Vec<&Host> = cfg
+        .hosts
+        .iter()
+        .filter(|h| h.host_type == HostType::Ssh)
+        .collect();
+
+    if targets.is_empty() {
+        println!(" 无 SSH 主机");
+        return Ok(());
+    }
+
+    println!("\n可用主机：");
+    for (i, h) in targets.iter().enumerate() {
+        println!("{}. {}@{}:{}", i + 1, h.username, h.ip, h.port);
+    }
+
+    let sel = read_line("选择主机 (1,3,5 或 all): ")?;
+    let list: Vec<&Host> = if sel.trim().eq_ignore_ascii_case("all") {
+        targets
+    } else {
+        sel.split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .filter(|&x| x > 0 && x <= targets.len())
+            .map(|x| targets[x - 1])
+            .collect()
+    };
+
+    if list.is_empty() {
+        println!(" 未选择有效主机");
+        return Ok(());
+    }
+
+    let cmd = read_line("请输入要执行的命令: ")?;
+    if cmd.is_empty() {
+        println!(" 命令不能为空");
+        return Ok(());
+    }
+
+    println!("\n 即将在 {} 台主机执行：", list.len());
+    println!(" 命令：{}", cmd);
+    if !confirm("确认执行？") {
+        println!(" 已取消");
+        return Ok(());
+    }
+
+    println!("\n开始执行...\n");
+    for h in list {
+        print!("[{}] {}@{} | 执行：{} ", h.name, h.username, h.ip, cmd);
+        io::stdout().flush()?;
+
+        let pwd = h.password().unwrap_or_default();
+        let res = run_ssh_cmd(h, &pwd, &cmd, &kh);
+
+        match res {
+            Ok(s) if s.success() => println!(" 成功"),
+            _ => println!(" 失败"),
+        }
+    }
+
+    Ok(())
+}
+
+// ==================== 配置菜单 ====================
+fn config_menu(_cfg: &mut Config) -> io::Result<()> {
+    loop {
+        println!("\n=== 配置管理 ===");
+        println!("1. 备份配置");
+        println!("2. 查看数据路径");
+        println!("0. 返回主菜单");
+
+        match read_line("请选择: ")? {
+            s if s == "1" => backup_config()?,
+            s if s == "2" => {
+                println!("配置文件: {}", get_config_path()?.display());
+                println!("SSH 已知主机: {}", get_known_hosts_path()?.display());
+                println!("缓存工具: {}", get_cache_dir()?.display());
+                println!("日志文件: {}", get_log_path()?.display());
+            }
+            s if s == "0" => break,
+            _ => println!(" 无效选项"),
+        }
+    }
+    Ok(())
+}
+
+// ==================== 主函数 ====================
+fn main() -> io::Result<()> {
+    // 1. 启动就检测所有依赖
+    check_all_dependencies()?;
+
+    init_logger()?;
+    info!("=== 远程管理工具启动 ===");
+
+    println!(" Remote Manager 多协议管理工具");
+    println!("数据目录: {}", get_base_dir()?.display());
+
+    let mut cfg = load_config().unwrap_or_else(|e| {
+        error!("配置加载失败: {}", e);
+        Config::default()
+    });
+
+    loop {
+        println!("\n{:=^55}", " 远程管理工具 ");
+        println!("1. 连接 RDP 主机");
+        println!("2. 连接 SSH 主机");
+        println!("3. 添加新主机");
+        println!("4. 编辑主机");
+        println!("5. 删除主机");
+        println!("6. SCP 文件传输");
+        println!("7. 批量执行命令");
+        println!("8. 配置管理");
+        println!("9. 批量检测主机连通性");
+        println!("0. 退出程序");
+        println!("{:=^55}", "");
+
+        match read_line("请输入选项 (0-9): ")? {
+            s if s == "1" => connect_rdp(&mut cfg)?,
+            s if s == "2" => connect_ssh(&mut cfg)?,
+            s if s == "3" => add_host(&mut cfg)?,
+            s if s == "4" => edit_host(&mut cfg)?,
+            s if s == "5" => delete_host(&mut cfg)?,
+            s if s == "6" => scp_transfer(&cfg)?,
+            s if s == "7" => batch_exec(&cfg)?,
+            s if s == "8" => config_menu(&mut cfg)?,
+            s if s == "9" => check_all_hosts_connectivity(&cfg)?,
+            s if ["0", "q", "Q"].contains(&s.as_str()) => {
+                info!("程序退出");
+                println!(" 再见！");
+                break;
+            }
+            _ => println!(" 无效输入，请重试"),
+        }
+    }
+
+    Ok(())
+}
